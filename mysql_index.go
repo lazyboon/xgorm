@@ -4,7 +4,6 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -221,7 +220,7 @@ func (m *MysqlIndex) Columns(cols ...*MysqlIndexColumn) *MysqlIndex {
 
 // ToSQL generates the final "CREATE [UNIQUE] INDEX..." DDL statement.
 // It performs validation on engine compatibility, column counts, and MySQL versions.
-func (m *MysqlIndex) ToSQL() (string, error) {
+func (m *MysqlIndex) ToSQL(db *gorm.DB) (string, error) {
 	if m.method == MysqlIndexHash && m.engine != "MEMORY" && m.engine != "NDB" {
 		return "", fmt.Errorf("HASH index requires MEMORY/NDB engine, current: %s", m.engine)
 	}
@@ -230,7 +229,7 @@ func (m *MysqlIndex) ToSQL() (string, error) {
 		return "", fmt.Errorf("column count %d is outside allowed range [1, %d]", len(m.columns), mysqlMaxColumnsPerIndex)
 	}
 
-	table := m.ResolveTableName()
+	table := m.ResolveTableName(db)
 	var buf strings.Builder
 	buf.WriteString("CREATE")
 
@@ -249,7 +248,7 @@ func (m *MysqlIndex) ToSQL() (string, error) {
 	}
 
 	buf.WriteString(" INDEX ")
-	idxName := m.ResolveIndexName()
+	idxName := m.ResolveIndexName(db)
 
 	fullPath := m.quoteIdent(table)
 	if m.database != "" {
@@ -261,11 +260,24 @@ func (m *MysqlIndex) ToSQL() (string, error) {
 		buf.WriteString("USING HASH ")
 	}
 
+	// Utilize GORM Statement to map field names to DB columns
+	stmt := &gorm.Statement{DB: db}
+	if m.model != nil {
+		_ = stmt.Parse(m.model)
+	}
+
 	var colSpecs []string
 	estimatedBytes := 0
 	for _, c := range m.columns {
 		if c.isExpression && m.serverVersion.Major < 8 {
 			return "", fmt.Errorf("functional index requires MySQL 8.0+, current: %d.%d", m.serverVersion.Major, m.serverVersion.Minor)
+		}
+
+		columnName := c.column
+		if !c.isExpression && stmt.Schema != nil {
+			if f, ok := stmt.Schema.FieldsByName[c.column]; ok {
+				columnName = f.DBName
+			}
 		}
 
 		order := "ASC"
@@ -275,9 +287,9 @@ func (m *MysqlIndex) ToSQL() (string, error) {
 
 		spec := ""
 		if c.isExpression {
-			spec = fmt.Sprintf("(%s)", c.column)
+			spec = fmt.Sprintf("(%s)", columnName)
 		} else {
-			spec = m.quoteIdent(c.column)
+			spec = m.quoteIdent(columnName)
 			if c.length > 0 {
 				spec += fmt.Sprintf("(%d)", c.length)
 				estimatedBytes += c.length
@@ -325,7 +337,7 @@ func (m *MysqlIndex) quoteIdent(s string) string {
 
 // ResolveIndexName generates a unique index name if not provided.
 // Format: {prefix}_{table_and_cols}_{sha1_hash}
-func (m *MysqlIndex) ResolveIndexName() string {
+func (m *MysqlIndex) ResolveIndexName(db *gorm.DB) string {
 	if m.name != "" {
 		return m.name
 	}
@@ -336,7 +348,7 @@ func (m *MysqlIndex) ResolveIndexName() string {
 
 	h := sha1.New()
 	h.Write([]byte(m.database))
-	h.Write([]byte(m.ResolveTableName()))
+	h.Write([]byte(m.ResolveTableName(db)))
 	readablePart := ""
 	for _, c := range m.columns {
 		h.Write([]byte(fmt.Sprintf("%s|%d|%s", c.column, c.length, c.order)))
@@ -351,7 +363,7 @@ func (m *MysqlIndex) ResolveIndexName() string {
 	overhead := len(prefix) + 2 + len(hashStr) // prefix + __ + hash
 	maxAvail := mysqlMaxIdentifierBytes - overhead
 
-	rawBody := m.ResolveTableName() + readablePart
+	rawBody := m.ResolveTableName(db) + readablePart
 	bodyIdx := m.maxTableLenByBytes(rawBody, maxAvail)
 	bodyPart := strings.TrimRight(rawBody[:bodyIdx], "_")
 
@@ -379,30 +391,8 @@ func (m *MysqlIndex) maxTableLenByBytes(s string, limit int) int {
 }
 
 // ResolveTableName retrieves the table name from explicit setting or GORM model metadata.
-func (m *MysqlIndex) ResolveTableName() string {
-	if m.table != "" {
-		return m.table
-	}
-	if tn, ok := m.model.(interface{ TableName() string }); ok {
-		return tn.TableName()
-	}
-	t := reflect.TypeOf(m.model)
-	if t == nil {
-		return ""
-	}
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-
-	name := t.Name()
-	var sb strings.Builder
-	for i, r := range name {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			sb.WriteRune('_')
-		}
-		sb.WriteRune(r)
-	}
-	return strings.ToLower(sb.String())
+func (m *MysqlIndex) ResolveTableName(db *gorm.DB) string {
+	return getTableName(db, m.model, m.table)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -461,23 +451,26 @@ func (m *MysqlIndexManager) Create() error {
 			targetDB = currentDB
 		}
 
+		tableName := idx.ResolveTableName(m.db)
+		indexName := idx.ResolveIndexName(m.db)
+
 		var count int64
 		checkSQL := `
-			SELECT COUNT(*) 
-			FROM INFORMATION_SCHEMA.STATISTICS 
+          SELECT COUNT(*) 
+          FROM INFORMATION_SCHEMA.STATISTICS 
             WHERE 
               TABLE_SCHEMA = ? 
               AND TABLE_NAME = ? 
               AND INDEX_NAME = ?
         `
-		if err := m.db.Raw(checkSQL, targetDB, idx.ResolveTableName(), idx.ResolveIndexName()).Scan(&count).Error; err != nil {
+		if err := m.db.Raw(checkSQL, targetDB, tableName, indexName).Scan(&count).Error; err != nil {
 			return err
 		}
 		if count > 0 {
 			continue
 		}
 
-		sql, err := idx.ToSQL()
+		sql, err := idx.ToSQL(m.db)
 		if err != nil {
 			return err
 		}
@@ -487,7 +480,7 @@ func (m *MysqlIndexManager) Create() error {
 			if errors.As(err, &me) && me.Number == 1061 {
 				continue
 			}
-			return fmt.Errorf("failed to create index %s: %w", idx.ResolveIndexName(), err)
+			return fmt.Errorf("failed to create index %s: %w", indexName, err)
 		}
 	}
 	return nil
@@ -510,18 +503,18 @@ func (m *MysqlIndexManager) CleanupGhost() error {
 		if db == "" {
 			db = currentDB
 		}
-		key := tk{db: db, table: idx.ResolveTableName()}
+		key := tk{db: db, table: idx.ResolveTableName(m.db)}
 		if managedMap[key] == nil {
 			managedMap[key] = make(map[string]bool)
 		}
-		managedMap[key][idx.ResolveIndexName()] = true
+		managedMap[key][idx.ResolveIndexName(m.db)] = true
 	}
 
 	for key, managedNames := range managedMap {
 		var dbNames []string
 		query := `
-			SELECT DISTINCT INDEX_NAME 
-			FROM INFORMATION_SCHEMA.STATISTICS 
+          SELECT DISTINCT INDEX_NAME 
+          FROM INFORMATION_SCHEMA.STATISTICS 
             WHERE 
                 TABLE_SCHEMA = ? 
               AND TABLE_NAME = ? 

@@ -3,7 +3,6 @@ package xgorm
 import (
 	"fmt"
 	"hash/fnv"
-	"reflect"
 	"regexp"
 	"strings"
 
@@ -352,8 +351,8 @@ func (p *PostgresIndex) Comment(c string) *PostgresIndex {
 }
 
 // ToSQL compiles the index definition into PostgreSQL DDL statements.
-func (p *PostgresIndex) ToSQL() ([]string, error) {
-	table := p.ResolveTableName()
+func (p *PostgresIndex) ToSQL(db *gorm.DB) ([]string, error) {
+	table := p.ResolveTableName(db)
 	if table == "" || len(p.columns) == 0 {
 		return nil, fmt.Errorf("index generation failed: table and columns are required")
 	}
@@ -365,6 +364,11 @@ func (p *PostgresIndex) ToSQL() ([]string, error) {
 		if err := p.options.validate(p.method); err != nil {
 			return nil, err
 		}
+	}
+
+	stmt := &gorm.Statement{DB: db}
+	if p.model != nil {
+		_ = stmt.Parse(p.model)
 	}
 
 	var buf strings.Builder
@@ -381,7 +385,7 @@ func (p *PostgresIndex) ToSQL() ([]string, error) {
 		buf.WriteString(" IF NOT EXISTS")
 	}
 
-	idxName := p.ResolveIndexName()
+	idxName := p.ResolveIndexName(db)
 	fullTableName := p.quoteIdent(table)
 	if p.schema != "" {
 		fullTableName = p.quoteIdent(p.schema) + "." + fullTableName
@@ -392,7 +396,14 @@ func (p *PostgresIndex) ToSQL() ([]string, error) {
 
 	var colSpecs []string
 	for _, c := range p.columns {
-		spec := c.column
+		columnName := c.column
+		if stmt.Schema != nil {
+			if f, ok := stmt.Schema.FieldsByName[c.column]; ok {
+				columnName = f.DBName
+			}
+		}
+
+		spec := columnName
 		if p.isSimpleColumn(spec) {
 			spec = p.quoteIdent(spec)
 		}
@@ -499,33 +510,12 @@ func (p *PostgresIndex) safeOpClass(op string) (string, error) {
 }
 
 // ResolveTableName resolves the table name while preserving case sensitivity.
-func (p *PostgresIndex) ResolveTableName() string {
-	if p.table != "" {
-		return p.table
-	}
-	if p.model == nil {
-		return ""
-	}
-	if tn, ok := p.model.(interface{ TableName() string }); ok {
-		return tn.TableName()
-	}
-	t := reflect.TypeOf(p.model)
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	name := t.Name()
-	var sb strings.Builder
-	for i, r := range name {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			sb.WriteRune('_')
-		}
-		sb.WriteRune(r)
-	}
-	return sb.String()
+func (p *PostgresIndex) ResolveTableName(db *gorm.DB) string {
+	return getTableName(db, p.model, p.table)
 }
 
 // ResolveIndexName generates a unique name. Uses FNV-64a hash to prevent truncation collisions on long names.
-func (p *PostgresIndex) ResolveIndexName() string {
+func (p *PostgresIndex) ResolveIndexName(db *gorm.DB) string {
 	if p.name != "" {
 		return p.name
 	}
@@ -534,7 +524,7 @@ func (p *PostgresIndex) ResolveIndexName() string {
 		prefix = "uk"
 	}
 
-	rawTable := strings.NewReplacer("\"", "", "'", "", ".", "_").Replace(p.ResolveTableName())
+	rawTable := strings.NewReplacer("\"", "", "'", "", ".", "_").Replace(p.ResolveTableName(db))
 	colMapper := strings.NewReplacer("(", "_", ")", "", " ", "_", ",", "_", "->>", "_", "->", "_")
 
 	var colNames []string
@@ -592,11 +582,11 @@ func NewPostgresIndexManager(db *gorm.DB, indexes []*PostgresIndex) *PostgresInd
 func (m *PostgresIndexManager) Create() error {
 	indexMap := make(map[string]*PostgresIndex)
 	for _, idx := range m.indexes {
-		indexMap[idx.ResolveIndexName()] = idx
+		indexMap[idx.ResolveIndexName(m.db)] = idx
 	}
 
 	for _, idx := range indexMap {
-		sqlSlice, err := idx.ToSQL()
+		sqlSlice, err := idx.ToSQL(m.db)
 		if err != nil {
 			return err
 		}
@@ -604,7 +594,7 @@ func (m *PostgresIndexManager) Create() error {
 		if idx.concurrently {
 			for _, sql := range sqlSlice {
 				if err := m.db.Exec(sql).Error; err != nil {
-					return fmt.Errorf("concurrent creation error for %s: %w", idx.ResolveIndexName(), err)
+					return fmt.Errorf("concurrent creation error for %s: %w", idx.ResolveIndexName(m.db), err)
 				}
 			}
 		} else {
@@ -617,7 +607,7 @@ func (m *PostgresIndexManager) Create() error {
 				return nil
 			})
 			if err != nil {
-				return fmt.Errorf("transactional creation error for %s: %w", idx.ResolveIndexName(), err)
+				return fmt.Errorf("transactional creation error for %s: %w", idx.ResolveIndexName(m.db), err)
 			}
 		}
 	}
@@ -633,19 +623,19 @@ func (m *PostgresIndexManager) CleanupGhost() error {
 	managedMap := make(map[tableKey]map[string]bool)
 
 	for _, idx := range m.indexes {
-		schema := idx.schema
-		if schema == "" {
-			schema = defaultPostgresSchema
+		schemaStr := idx.schema
+		if schemaStr == "" {
+			schemaStr = defaultPostgresSchema
 		}
 
 		tk := tableKey{
-			schema: schema,
-			table:  idx.ResolveTableName(),
+			schema: schemaStr,
+			table:  idx.ResolveTableName(m.db),
 		}
 		if managedMap[tk] == nil {
 			managedMap[tk] = make(map[string]bool)
 		}
-		managedMap[tk][idx.ResolveIndexName()] = true
+		managedMap[tk][idx.ResolveIndexName(m.db)] = true
 	}
 
 	for tk, managedNames := range managedMap {
