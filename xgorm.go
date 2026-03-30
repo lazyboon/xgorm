@@ -30,17 +30,21 @@ func Init(configs []*Config) error {
 
 // Open initializes a single database connection and registers it to the manager.
 func Open(cfg *Config) (*gorm.DB, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("xgorm: config is required")
+	}
+
+	cfg.FillDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	cfg.FillDefaults()
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Ensure no duplicate registration for the same alias
-	if db, ok := instances[cfg.Alias]; ok {
-		return db, nil
+	if _, ok := instances[cfg.Alias]; ok {
+		return nil, fmt.Errorf("xgorm: alias [%s] is already registered", cfg.Alias)
 	}
 
 	// Multi-driver dispatcher
@@ -72,6 +76,9 @@ func Open(cfg *Config) (*gorm.DB, error) {
 
 	// Setup connection pool and check health
 	if err = applyPoolSettings(db, cfg); err != nil {
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
 		return nil, err
 	}
 

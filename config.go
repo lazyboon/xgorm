@@ -71,6 +71,9 @@ type Config struct {
 
 // FillDefaults populates empty fields with production-ready default values.
 func (cfg *Config) FillDefaults() {
+	if cfg == nil {
+		return
+	}
 	if cfg.Driver == "" {
 		cfg.Driver = DriverMySQL
 	}
@@ -94,6 +97,9 @@ func (cfg *Config) FillDefaults() {
 
 // Validate checks for mandatory fields and driver validity.
 func (cfg *Config) Validate() error {
+	if cfg == nil {
+		return fmt.Errorf("xgorm: config is required")
+	}
 	if cfg.Alias == "" {
 		return fmt.Errorf("xgorm: alias is required")
 	}

@@ -360,6 +360,9 @@ func (p *PostgresIndex) ToSQL(db *gorm.DB) ([]string, error) {
 	if err := p.method.Validate(); err != nil {
 		return nil, err
 	}
+	if p.unique && p.method != PostgresIndexBTree {
+		return nil, fmt.Errorf("UNIQUE index is only supported with BTREE method, current: %s", p.method)
+	}
 	if p.options != nil {
 		if err := p.options.validate(p.method); err != nil {
 			return nil, err
@@ -568,14 +571,67 @@ type PostgresIndexManager struct {
 
 	// indexes is the list of indexes to manage.
 	indexes []*PostgresIndex
+
+	// managedPrefixes identifies auto-managed index name prefixes.
+	managedPrefixes []string
+
+	// whiteList holds index names that should never be dropped.
+	whiteList []string
 }
 
 // NewPostgresIndexManager initializes a manager with the provided DB and index list.
 func NewPostgresIndexManager(db *gorm.DB, indexes []*PostgresIndex) *PostgresIndexManager {
 	return &PostgresIndexManager{
-		db:      db,
-		indexes: indexes,
+		db:              db,
+		indexes:         indexes,
+		managedPrefixes: []string{"idx", "uk"},
+		whiteList:       []string{},
 	}
+}
+
+// Prefixes appends extra managed index prefixes used by CleanupGhost.
+func (m *PostgresIndexManager) Prefixes(prefixes ...string) *PostgresIndexManager {
+	m.managedPrefixes = append(m.managedPrefixes, prefixes...)
+	return m
+}
+
+// WhiteList appends index names that CleanupGhost must ignore.
+func (m *PostgresIndexManager) WhiteList(names ...string) *PostgresIndexManager {
+	m.whiteList = append(m.whiteList, names...)
+	return m
+}
+
+func (m *PostgresIndexManager) getManagedRegex() *regexp.Regexp {
+	escaped := make([]string, 0, len(m.managedPrefixes))
+	for _, p := range m.managedPrefixes {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		escaped = append(escaped, regexp.QuoteMeta(p))
+	}
+	if len(escaped) == 0 {
+		return nil
+	}
+	return regexp.MustCompile(fmt.Sprintf(`(?i)^(%s)_`, strings.Join(escaped, "|")))
+}
+
+func (m *PostgresIndexManager) isWhiteListed(name string) bool {
+	for _, w := range m.whiteList {
+		if strings.EqualFold(w, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *PostgresIndexManager) shouldDropGhostIndex(name string, managedNames map[string]bool, managedPattern *regexp.Regexp) bool {
+	if m.isWhiteListed(name) {
+		return false
+	}
+	if managedPattern == nil || !managedPattern.MatchString(name) {
+		return false
+	}
+	return !managedNames[name]
 }
 
 // Create executes DDL for all managed indexes, handling concurrent creation safely.
@@ -621,6 +677,7 @@ func (m *PostgresIndexManager) CleanupGhost() error {
 		table  string
 	}
 	managedMap := make(map[tableKey]map[string]bool)
+	managedPattern := m.getManagedRegex()
 
 	for _, idx := range m.indexes {
 		schemaStr := idx.schema
@@ -652,7 +709,7 @@ func (m *PostgresIndexManager) CleanupGhost() error {
 		}
 
 		for _, dbName := range existingNames {
-			if !managedNames[dbName] {
+			if m.shouldDropGhostIndex(dbName, managedNames, managedPattern) {
 				p := &PostgresIndex{}
 				dropPath := p.quoteIdent(dbName)
 				if tk.schema != "" {

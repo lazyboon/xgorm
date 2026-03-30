@@ -429,7 +429,18 @@ func (m *MysqlIndexManager) WhiteList(w ...string) *MysqlIndexManager {
 
 // getManagedRegex compiles the regex pattern used to scan for auto-generated indexes.
 func (m *MysqlIndexManager) getManagedRegex() *regexp.Regexp {
-	pattern := fmt.Sprintf(`^(%s)_.*_[0-9a-f]{16}$`, strings.Join(m.managedPrefixes, "|"))
+	escaped := make([]string, 0, len(m.managedPrefixes))
+	for _, p := range m.managedPrefixes {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		escaped = append(escaped, regexp.QuoteMeta(p))
+	}
+	if len(escaped) == 0 {
+		return regexp.MustCompile(`^$`)
+	}
+	pattern := fmt.Sprintf(`^(%s)_.*_[0-9a-f]{16}$`, strings.Join(escaped, "|"))
 	return regexp.MustCompile(pattern)
 }
 
